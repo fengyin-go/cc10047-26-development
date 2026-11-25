@@ -13,6 +13,9 @@ from app.compute import (
     retention_checker,
     version_conflict_resolver,
     delta_reconciler,
+    ingest_quality_partition_verdict,
+    select_publishable_partitions,
+    detect_sample_conflict,
 )
 
 
@@ -146,3 +149,65 @@ class TestDeltaReconciler:
         result = delta_reconciler([], [{"id": 1, "val": "a"}], dedup_key="id")
         assert result["stream_count"] == 0
         assert result["reconciled_total"] == 1
+
+
+class TestIngestQualityPartitionVerdict:
+    def test_p1_meets_80_percent_threshold(self):
+        result = ingest_quality_partition_verdict(9, 10, 0.8, partition="p1")
+        assert result["valid_rate"] == 0.9
+        assert result["passed"] is True
+        assert result["threshold"] == 0.8
+
+    def test_p2_below_80_percent_threshold(self):
+        result = ingest_quality_partition_verdict(1, 2, 0.8, partition="p2")
+        assert result["valid_rate"] == 0.5
+        assert result["passed"] is False
+
+    def test_threshold_boundary_inclusive(self):
+        result = ingest_quality_partition_verdict(8, 10, 0.8, partition="p-edge")
+        assert result["valid_rate"] == 0.8
+        assert result["passed"] is True
+
+    def test_empty_window_cannot_pass(self):
+        result = ingest_quality_partition_verdict(0, 0, 0.8, partition="p-empty")
+        assert result["passed"] is False
+        assert result["total_rows"] == 0
+
+    def test_all_valid_rule(self):
+        passed = ingest_quality_partition_verdict(10, 10, 0.8, rule="all_valid")
+        failed = ingest_quality_partition_verdict(9, 10, 0.99, rule="all_valid")
+        assert passed["passed"] is True
+        assert failed["passed"] is False
+
+    def test_select_publishable_partitions_no_cross_offset(self):
+        verdicts = [
+            ingest_quality_partition_verdict(9, 10, 0.8, partition="p1"),
+            ingest_quality_partition_verdict(1, 2, 0.8, partition="p2"),
+        ]
+        # 整体 10/12 达标，但只有 p1 进入发布范围，p1 合格样本不能抵掉 p2
+        assert select_publishable_partitions(verdicts) == ["p1"]
+
+
+class TestDetectSampleConflict:
+    def test_late_correction_conflict(self):
+        frozen = {
+            "window_id": "win-p2", "valid_rows": 1, "total_rows": 2,
+            "source_refs": ["s1"], "passed": False,
+        }
+        current = {
+            "window_id": "win-p2", "valid_rows": 2, "total_rows": 2,
+            "source_refs": ["s1", "s2-late"], "passed": True,
+        }
+        result = detect_sample_conflict(frozen, current)
+        assert result["conflict"] is True
+        assert "valid_rows" in result["changed_fields"]
+        assert "source_refs" in result["changed_fields"]
+        assert result["frozen_valid_rate"] == 0.5
+        assert result["current_valid_rate"] == 1.0
+
+    def test_unchanged_sample_no_conflict(self):
+        sample = {
+            "window_id": "win-p1", "valid_rows": 9, "total_rows": 10,
+            "source_refs": ["s1"], "passed": True,
+        }
+        assert detect_sample_conflict(sample, dict(sample))["conflict"] is False

@@ -267,6 +267,101 @@ def delta_reconciler(
 
 
 # ------------------------------------------------------------------
+# ingest_quality_partition_verdict
+# ------------------------------------------------------------------
+
+def ingest_quality_partition_verdict(
+    valid_rows: int,
+    total_rows: int,
+    threshold: float,
+    *,
+    rule: str = "ratio",
+    partition: str | None = None,
+) -> dict[str, Any]:
+    """按分区采样窗口计算摄入质量判定。
+
+    每个分区独立使用自己的阈值和判定规则，合格数/输入行数在分区内闭环，
+    不允许跨分区抵消（p1 的合格样本不能抵掉 p2 的失败）。
+    - ratio：有效率 = 合格数 / 输入行数，有效率达到阈值即合格；
+    - all_valid：采样行必须全部合格。
+    """
+    valid_rows = max(0, int(valid_rows))
+    total_rows = max(0, int(total_rows))
+    if total_rows == 0:
+        return {
+            "partition": partition,
+            "rule": rule,
+            "threshold": threshold,
+            "valid_rows": 0,
+            "total_rows": 0,
+            "valid_rate": 0.0,
+            "passed": False,
+            "reason": "采样窗口内没有输入行，无法判定",
+        }
+    valid_rate = valid_rows / total_rows
+    if rule == "all_valid":
+        passed = valid_rows == total_rows
+        reason = "采样行全部合格" if passed else "存在不合格采样行"
+    else:
+        rule = "ratio"
+        passed = valid_rate >= threshold
+        reason = (
+            f"有效率 {valid_rate:.4f} 达到阈值 {threshold}"
+            if passed else f"有效率 {valid_rate:.4f} 低于阈值 {threshold}"
+        )
+    return {
+        "partition": partition,
+        "rule": rule,
+        "threshold": threshold,
+        "valid_rows": valid_rows,
+        "total_rows": total_rows,
+        "valid_rate": round(valid_rate, 6),
+        "passed": passed,
+        "reason": reason,
+    }
+
+
+def select_publishable_partitions(verdicts: list[dict[str, Any]]) -> list[str]:
+    """从一批分区判定中挑出可发布分区，未通过的分区被阻断在外。"""
+    return [
+        str(verdict["partition"])
+        for verdict in verdicts
+        if verdict.get("passed") and verdict.get("partition") is not None
+    ]
+
+
+def detect_sample_conflict(
+    frozen_sample: dict[str, Any],
+    current_sample: dict[str, Any],
+) -> dict[str, Any]:
+    """比对提交时冻结的样本与迟到更正后的当前样本，输出冲突证据。"""
+    tracked_keys = ("valid_rows", "total_rows", "source_refs", "window_id")
+    changed_fields = [
+        key
+        for key in tracked_keys
+        if frozen_sample.get(key) != current_sample.get(key)
+    ]
+    frozen_rate = (
+        frozen_sample.get("valid_rows", 0) / frozen_sample["total_rows"]
+        if frozen_sample.get("total_rows") else 0.0
+    )
+    current_rate = (
+        current_sample.get("valid_rows", 0) / current_sample["total_rows"]
+        if current_sample.get("total_rows") else 0.0
+    )
+    return {
+        "conflict": bool(changed_fields),
+        "changed_fields": changed_fields,
+        "frozen_sample": dict(frozen_sample),
+        "current_sample": dict(current_sample),
+        "frozen_valid_rate": round(frozen_rate, 6),
+        "current_valid_rate": round(current_rate, 6),
+        "frozen_passed": frozen_sample.get("passed"),
+        "current_passed": current_sample.get("passed"),
+    }
+
+
+# ------------------------------------------------------------------
 # helpers
 # ------------------------------------------------------------------
 

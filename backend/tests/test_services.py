@@ -147,6 +147,31 @@ class TestStreamCheckpoint:
         assert "checksum" in result
 
 
+class TestStreamQualityGate:
+    def test_evaluate_partition_samples(self):
+        svc = service_for("stream_quality")
+        result = svc.domain_evaluate_partition_samples(
+            1,
+            [
+                {"partition": "svc-p1", "valid_rows": 9, "total_rows": 10,
+                 "threshold": 0.8, "window_id": "win-svc-p1",
+                 "source_refs": ["src-a"]},
+                {"partition": "svc-p2", "valid_rows": 1, "total_rows": 2,
+                 "threshold": 0.8, "window_id": "win-svc-p2",
+                 "source_refs": ["src-b"]},
+            ],
+        )
+        assert result["ok"] is True
+        assert result["publishable_partitions"] == ["svc-p1"]
+        entry = svc.get_entry(1)
+        assert "可发布分区 1/2" in entry["上次结果"]
+
+    def test_evaluate_unknown_check_rejected(self):
+        svc = service_for("stream_quality")
+        result = svc.domain_evaluate_partition_samples(99999, [])
+        assert result["ok"] is False
+
+
 class TestDomainSnapshot:
     def test_all_services_have_domain_snapshot(self):
         """确保所有18个服务都有 domain_snapshot 方法。"""
